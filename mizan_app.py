@@ -23,6 +23,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.ticker import FuncFormatter  # noqa: E402
+import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import streamlit as st  # noqa: E402
 
@@ -54,7 +55,7 @@ CAT_COLOR = {
 MAJORELLE, SAFFRON, ROSE, MINT = "#5B4BDB", "#F2A93B", "#E0607E", "#2FA98C"
 
 PAGES = ["🏠 Dashboard", "➕ Add expense", "📋 Expenses",
-         "📊 Analytics", "💰 Budget", "🗂️ Data"]
+         "📊 Analytics", "💰 Budget", "🎲 Budget risk", "🗂️ Data"]
 
 # Quick-add buttons on the Add page: (emoji, description, amount, category)
 PRESETS = [
@@ -242,6 +243,65 @@ def month_total(df, year, month):
     return float(df.loc[mask, "amount"].sum()), int(mask.sum())
 
 
+# =============================================================================
+# Monte Carlo budget risk
+# =============================================================================
+MC_SIMULATIONS = 10_000
+MC_MIN_DAYS = 7
+MC_HALF_LIFE = 21  # days; used when recent spending is weighted more
+
+
+def daily_history(df):
+    """Total spent on each calendar day from the first expense to today.
+    Days with no spending are included as 0, because quiet days are part of the pattern."""
+    past = df[df["date"].dt.date <= date.today()]
+    if past.empty:
+        return pd.Series(dtype=float)
+    daily = past.groupby(past["date"].dt.normalize())["amount"].sum()
+    days = pd.date_range(daily.index.min(), pd.Timestamp(date.today()))
+    return daily.reindex(days, fill_value=0.0)
+
+
+def simulate_spending(daily, horizon, weight_recent=False, n_sims=MC_SIMULATIONS, seed=42):
+    """Bootstrap simulation of future spending.
+
+    Each simulated future is built by drawing `horizon` days at random (with
+    replacement) from the user's own daily spending history. Returns an array of
+    shape (n_sims, horizon) with the cumulative extra spending along each path.
+    """
+    values = daily.to_numpy(dtype=float)
+    probabilities = None
+    if weight_recent:
+        age = np.arange(len(values))[::-1]          # 0 = today, 1 = yesterday, ...
+        weights = 0.5 ** (age / MC_HALF_LIFE)        # weight halves every MC_HALF_LIFE days
+        probabilities = weights / weights.sum()
+    rng = np.random.default_rng(seed)
+    draws = rng.choice(values, size=(n_sims, horizon), replace=True, p=probabilities)
+    return draws.cumsum(axis=1)
+
+
+def pct_text(value):
+    """Readable percentage: avoids showing a misleading 0% or 100% for rare outcomes."""
+    if 0 < value < 1:
+        return "less than 1%"
+    if 99 < value < 100:
+        return "more than 99%"
+    return "%.0f%%" % value
+
+
+def month_end_risk(df, budget):
+    """Chance (0-100) of passing the budget by the end of this month, or None if
+    there isn't enough history or no days are left to simulate."""
+    daily = daily_history(df)
+    today = date.today()
+    days_left = monthrange(today.year, today.month)[1] - today.day
+    if len(daily) < MC_MIN_DAYS or days_left < 1:
+        return None
+    total = df.loc[df["date"].dt.date <= today, "amount"].sum()
+    paths = simulate_spending(daily, days_left)
+    return float(((total + paths[:, -1]) > budget).mean() * 100)
+
+
 def dark_mode():
     try:
         return st.context.theme.type == "dark"
@@ -364,7 +424,7 @@ h2 { font-weight: 800 !important; }
           mask: radial-gradient(farthest-side, transparent calc(100% - 20px), #000 calc(100% - 19px)); }
 .mz-gauge-label { position: absolute; inset: 0; display: grid; place-content: center; text-align: center; }
 .mz-gauge-pct { font-family: 'Bricolage Grotesque', sans-serif; font-size: 2.7rem; font-weight: 800; letter-spacing: -0.04em; line-height: 1; }
-.mz-gauge-sub { opacity: .7; font-size: .85rem; margin-top: .2rem; }
+.mz-gauge-sub { opacity: .7; font-size: .85rem; margin: .2rem auto 0; max-width: 130px; line-height: 1.3; }
 
 .mz-insight { font-size: 1rem; line-height: 1.5; padding: .55rem 0; border-bottom: 1px solid rgba(128,128,150,.18); }
 .mz-insight:last-child { border-bottom: none; }
@@ -392,12 +452,13 @@ def receipt_html(title, subtitle, lines, totals, footer):
     return "".join(parts)
 
 
-def gauge_html(percent):
-    color = MINT if percent < 80 else (SAFFRON if percent <= 100 else ROSE)
+def gauge_html(percent, label="of budget used", thresholds=(80, 100)):
+    low, high = thresholds
+    color = MINT if percent < low else (SAFFRON if percent <= high else ROSE)
     return ('<div class="mz-gauge" style="--p:%.1f; --c:%s"><div class="mz-ring"></div>'
             '<div class="mz-gauge-label"><div class="mz-gauge-pct">%.0f%%</div>'
-            '<div class="mz-gauge-sub">of budget used</div></div></div>'
-            % (min(percent, 100), color, percent))
+            '<div class="mz-gauge-sub">%s</div></div></div>'
+            % (min(percent, 100), color, percent, html.escape(label)))
 
 
 def category_bar_figure(totals, for_download=False):
@@ -653,6 +714,13 @@ def build_insights(df, budget):
             end = today + timedelta(days=runway)
             insights.append("💰 At %s a day, your remaining budget lasts about %d more days, "
                             "until %s." % (fmt(avg), runway, end.strftime("%d %B")))
+            risk = month_end_risk(df, budget)
+            if risk is not None and risk > 0:
+                insights.append("🎲 In 10,000 simulated futures, you go over budget by the end "
+                                "of %s in %s of them." % (today.strftime("%B"), pct_text(risk)))
+            elif risk is not None:
+                insights.append("🎲 You stay within budget until the end of %s in all 10,000 "
+                                "simulated futures." % today.strftime("%B"))
     return insights
 
 
@@ -912,6 +980,7 @@ def page_budget(expenses, budget):
                 notify("Budget saved: %s." % fmt(new_budget), "💰")
                 st.rerun()
         if budget:
+            st.button("See your budget risk", on_click=go_to, args=(PAGES[5],), type="primary")
             st.button("Remove budget", on_click=remove_budget)
 
     with right:
@@ -949,6 +1018,180 @@ def page_budget(expenses, budget):
             "Of budget": st.column_config.ProgressColumn("Share of budget", format="%.1f%%",
                                                          min_value=0, max_value=100),
         })
+
+
+def page_risk(expenses, budget):
+    st.markdown("## Budget risk")
+    st.caption("A Monte Carlo simulation of how your spending could play out, "
+               "built from your own day-to-day history.")
+
+    if not budget:
+        st.info("Set a budget first. The simulation estimates your chance of going over it.")
+        st.button("Set a budget", on_click=go_to, args=(PAGES[4],), type="primary")
+        return
+    if not expenses:
+        empty_state("Add some expenses so the simulation has history to learn from.")
+        return
+
+    df = to_frame(expenses)
+    daily = daily_history(df)
+    if len(daily) < MC_MIN_DAYS:
+        st.warning("The simulation needs at least %d days of history to learn from, and you "
+                   "have %d so far. Keep logging, or load sample data to try it out."
+                   % (MC_MIN_DAYS, len(daily)))
+        st.button("Load sample data", on_click=load_sample_data)
+        return
+
+    today = date.today()
+    days_left = monthrange(today.year, today.month)[1] - today.day
+    total = float(df.loc[df["date"].dt.date <= today, "amount"].sum())
+    st.session_state.setdefault("mc_seed", 42)
+
+    # --- Controls -----------------------------------------------------------
+    c1, c2, c3 = st.columns([2.2, 1.4, 1], vertical_alignment="bottom")
+    horizon = c1.slider("Days to simulate", 1, 90, max(days_left, 1),
+                        help="Starts at the days left in this month, not counting today.")
+    weight_recent = c2.toggle("Weight recent weeks more", value=False,
+                              help="A day's chance of being drawn halves every %d days back, "
+                                   "so your latest habits count most." % MC_HALF_LIFE)
+    if c3.button("Re-run", width="stretch",
+                 help="Run the 10,000 simulations again with a new random seed."):
+        st.session_state["mc_seed"] += 1
+
+    paths = simulate_spending(daily, horizon, weight_recent, seed=st.session_state["mc_seed"])
+    finals = total + paths[:, -1]
+    risk = float((finals > budget).mean() * 100)
+    p10, p50, p90 = np.percentile(finals, [10, 50, 90])
+    end_date = today + timedelta(days=horizon)
+    end_label = end_date.strftime("%d %B")
+    remaining = budget - total
+
+    # --- Headline -----------------------------------------------------------
+    left, right = st.columns([1, 1.6], gap="large")
+    with left:
+        st.markdown(gauge_html(risk, "chance of going over budget",
+                               thresholds=(25, 60)), unsafe_allow_html=True)
+    with right:
+        if remaining <= 0:
+            st.error("You're already %s over budget, so the risk is 100%%. The simulation "
+                     "shows how much further spending could go by %s." % (fmt(-remaining), end_label))
+        elif risk >= 60:
+            st.error("High risk: in %s of 10,000 simulated futures you pass your budget "
+                     "by %s." % (pct_text(risk), end_label))
+        elif risk >= 25:
+            st.warning("Moderate risk: %s of simulated futures go over budget by %s."
+                       % (pct_text(risk), end_label))
+        elif risk > 0:
+            st.success("Low risk: %s of simulated futures go over budget by %s."
+                       % (pct_text(risk), end_label))
+        else:
+            st.success("Very low risk: none of the 10,000 simulated futures go over budget by %s."
+                       % end_label)
+        m1, m2 = st.columns(2)
+        m1.metric("Likely total by " + end_label, fmt(p50), border=True,
+                  help="The median outcome: half of the simulations end above this, half below.")
+        m2.metric("80% range", "{:,.0f} to {:,.0f}".format(p10, p90), border=True,
+                  help="8 out of 10 simulations end between these two totals (10th to 90th percentile).")
+        m3, m4 = st.columns(2)
+        if remaining > 0:
+            m3.metric("Safe daily spend", fmt(remaining / horizon), border=True,
+                      help="What you can spend per day for the next %d days and still finish "
+                           "exactly on budget." % horizon)
+        else:
+            m3.metric("Safe daily spend", fmt(0), border=True)
+        m4.metric("Your average day", fmt(float(daily.mean())), border=True,
+                  help="Average over all %d days of history, including days with no spending."
+                       % len(daily))
+
+    # --- Charts -------------------------------------------------------------
+    tab1, tab2 = st.tabs(["Possible outcomes", "Spending paths"])
+    with tab1:
+        counts, edges = np.histogram(finals, bins=40)
+        hist = pd.DataFrame({"start": edges[:-1], "end": edges[1:], "count": counts})
+        hist["share"] = hist["count"] / MC_SIMULATIONS * 100
+        hist["outcome"] = np.where((hist["start"] + hist["end"]) / 2 > budget,
+                                   "Over budget", "Within budget")
+        bars = alt.Chart(hist).mark_bar().encode(
+            x=alt.X("start:Q", title="Total spent by %s (MAD)" % end_label, bin="binned"),
+            x2="end:Q",
+            y=alt.Y("share:Q", title="% of simulations",
+                    scale=alt.Scale(domain=[0, float(hist["share"].max()) * 1.3])),
+            color=alt.Color("outcome:N", title=None, legend=alt.Legend(orient="bottom"),
+                            scale=alt.Scale(domain=["Within budget", "Over budget"],
+                                            range=[MINT, ROSE])),
+            tooltip=[alt.Tooltip("start:Q", title="From (MAD)", format=",.0f"),
+                     alt.Tooltip("end:Q", title="To (MAD)", format=",.0f"),
+                     alt.Tooltip("share:Q", title="% of simulations", format=".1f")],
+        )
+        marks = pd.DataFrame({"x": [budget, p50], "ypos": [12, 30],
+                              "label": ["Budget " + fmt(budget), "Median " + fmt(p50)]})
+        ink = "#ECE9F5" if dark_mode() else "#25212F"
+        rules = alt.Chart(marks).mark_rule(strokeDash=[6, 4], strokeWidth=2).encode(
+            x="x:Q", color=alt.value(ink))
+        labels = alt.Chart(marks).mark_text(align="left", dx=5, fontWeight="bold",
+                                            color=ink).encode(
+            x="x:Q", y=alt.Y("ypos:Q", scale=None, axis=None), text="label:N")
+        st.altair_chart(alt.layer(bars, rules, labels).properties(height=340))
+        st.caption("Each bar shows how many of the 10,000 simulated futures ended in that range.")
+
+    with tab2:
+        steps = np.arange(horizon + 1)
+        cumulative = np.hstack([np.zeros((paths.shape[0], 1)), paths]) + total
+        bands = pd.DataFrame({
+            "date": [pd.Timestamp(today + timedelta(days=int(s))) for s in steps],
+            "p5": np.percentile(cumulative, 5, axis=0),
+            "p25": np.percentile(cumulative, 25, axis=0),
+            "p50": np.percentile(cumulative, 50, axis=0),
+            "p75": np.percentile(cumulative, 75, axis=0),
+            "p95": np.percentile(cumulative, 95, axis=0),
+        })
+        sample = []
+        for i in range(25):
+            for s in steps:
+                sample.append({"date": bands["date"].iloc[s], "path": i,
+                               "total": float(cumulative[i, s])})
+        sample = pd.DataFrame(sample)
+
+        x = alt.X("date:T", title=None)
+        outer = alt.Chart(bands).mark_area(opacity=0.18, color=MAJORELLE).encode(
+            x=x, y=alt.Y("p5:Q", title="Total spent (MAD)", scale=alt.Scale(zero=False)),
+            y2="p95:Q")
+        inner = alt.Chart(bands).mark_area(opacity=0.32, color=MAJORELLE).encode(
+            x=x, y="p25:Q", y2="p75:Q")
+        some = alt.Chart(sample).mark_line(opacity=0.25, strokeWidth=1, color=MAJORELLE).encode(
+            x=x, y="total:Q", detail="path:N")
+        median = alt.Chart(bands).mark_line(color=MAJORELLE, strokeWidth=3).encode(
+            x=x, y="p50:Q",
+            tooltip=[alt.Tooltip("date:T", title="Date"),
+                     alt.Tooltip("p50:Q", title="Median", format=",.2f"),
+                     alt.Tooltip("p5:Q", title="5th percentile", format=",.2f"),
+                     alt.Tooltip("p95:Q", title="95th percentile", format=",.2f")])
+        line = pd.DataFrame({"budget": [budget]})
+        budget_rule = alt.Chart(line).mark_rule(color=ROSE, strokeDash=[6, 4],
+                                                strokeWidth=2).encode(y="budget:Q")
+        st.altair_chart(alt.layer(outer, inner, some, median, budget_rule).properties(height=340))
+        st.caption("Dark line: median path. Shaded bands: middle 50% and middle 90% of simulations. "
+                   "Thin lines: 25 individual simulated futures. Dashed line: your budget.")
+
+    with st.expander("How the simulation works"):
+        st.markdown(
+            "1. **Build the history.** Your expenses are summed per calendar day, from your first "
+            "expense to today (%d days). Days with no spending count as 0 MAD.\n"
+            "2. **Simulate one future.** For each of the next %d days, one day is drawn at random "
+            "from that history, with replacement, and its spending is added up. This is called "
+            "bootstrapping: the future is assumed to look like a reshuffled version of your past.\n"
+            "3. **Repeat 10,000 times.** Each run gives a different total, because different days "
+            "get drawn. Rare big days, like a large one-off purchase, show up only occasionally, "
+            "just as they did in reality.\n"
+            "4. **Count the outcomes.** The risk is the share of runs where what you've already "
+            "spent (%s) plus the simulated spending ends above your budget (%s).\n\n"
+            "**Assumptions to keep in mind:** days are drawn independently, so streaks and "
+            "seasonality aren't modeled, and the history needs to be representative. A month with "
+            "unusual events like travel or Ramadan will shape the simulation. With *Weight recent "
+            "weeks more* on, a day's chance of being drawn halves every %d days back in time. "
+            "The random seed is fixed so the numbers stay stable, and *Re-run* changes it to show "
+            "how little the results move."
+            % (len(daily), horizon, fmt(total), fmt(budget), MC_HALF_LIFE))
 
 
 def page_data(expenses):
@@ -1041,5 +1284,7 @@ elif page == PAGES[3]:
     page_analytics(expenses)
 elif page == PAGES[4]:
     page_budget(expenses, budget)
+elif page == PAGES[5]:
+    page_risk(expenses, budget)
 else:
     page_data(expenses)
